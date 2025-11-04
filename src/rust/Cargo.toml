@@ -1,0 +1,12 @@
+[package]
+name = "ros2_lang_eval_rust"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rust_benchmark_node"
+path = "src/main.rs"
+
+[dependencies]
+rclrs = "0.1"
+std_msgs = { version = "1.0", features = ["msg"] }
