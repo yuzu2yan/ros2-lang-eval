@@ -10,14 +10,15 @@ find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 # Python package installation
 ament_python_install_package(ros2_lang_eval
-  PACKAGE_DIR src/ros2_lang_eval
+  PACKAGE_DIR src/python
 )
 
 # C++ executable
-add_executable(cpp_benchmark_node src/cpp_benchmark_node.cpp)
+add_executable(cpp_benchmark_node src/cpp/cpp_benchmark_node.cpp)
 target_include_directories(cpp_benchmark_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -25,6 +26,7 @@ target_include_directories(cpp_benchmark_node PUBLIC
 ament_target_dependencies(cpp_benchmark_node
   rclcpp
   std_msgs
+  sensor_msgs
 )
 
 # Install C++ executable

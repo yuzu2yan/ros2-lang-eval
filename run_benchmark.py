@@ -1,131 +1,188 @@
 #!/usr/bin/env python3
 """
-Benchmark runner script that runs all three language implementations
-and collects performance metrics.
+Main benchmark script for ROS2 language performance evaluation.
+
+This script acts as the 'pinger' and controller. It launches a 'pong' node
+(written in C++, Python, or Rust), sends it a message, and waits for the
+message to be echoed back, measuring the round-trip latency.
+
+It iterates through a list of predefined targets (different languages) and
+prints a comparative summary at the end.
 """
 
-import subprocess
-import signal
-import sys
-import time
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float64
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+import time
+import subprocess
+import sys
+import numpy as np
+import collections
 
+from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import Header
 
-class BenchmarkSubscriber(Node):
-    """Subscriber to collect benchmark results."""
+# --- Benchmark Target Configuration ---
+# Defines the different language nodes to be benchmarked.
+# The 'executable' is what `ros2 run <package> <executable>` expects.
+TARGETS = [
+    {
+        'lang': 'Python',
+        'package': 'ros2_lang_eval',
+        'executable': 'python_benchmark_node.py',
+        'pong_topic': 'pong_python',
+    },
+    {
+        'lang': 'C++',
+        'package': 'ros2_lang_eval',
+        'executable': 'cpp_benchmark_node',
+        'pong_topic': 'pong_cpp',
+    },
+    {
+        'lang': 'Rust',
+        'package': 'ros2_lang_eval_rust',
+        'executable': 'rust_benchmark_node',
+        'pong_topic': 'pong_rust',
+    },
+]
 
-    def __init__(self, language_name):
-        super().__init__(f'benchmark_subscriber_{language_name}')
-        self.language_name = language_name
-        self.results = []
+class BenchmarkRunner(Node):
+    """Node for running the benchmark, sending pings and receiving pongs."""
+
+    def __init__(self, pong_topic):
+        super().__init__('benchmark_runner')
+        self.pong_received_time = None
+        self.pong_received = False
+
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
+        self.publisher = self.create_publisher(PointCloud2, 'ping', qos_profile)
         self.subscription = self.create_subscription(
-            Float64,
-            f'{language_name}_benchmark_result',
-            self.callback,
-            10)
+            PointCloud2,
+            pong_topic,
+            self.pong_callback,
+            qos_profile)
+        
+    def pong_callback(self, msg):
+        self.pong_received_time = self.get_clock().now()
+        self.pong_received = True
 
-    def callback(self, msg):
-        """Callback to receive benchmark results."""
-        self.results.append(msg.data)
-        self.get_logger().info(
-            f'{self.language_name} benchmark result: {msg.data:.6f} seconds')
+    def create_point_cloud_message(self, num_points=100000):
+        points = np.random.rand(num_points, 3).astype(np.float32)
+        msg = PointCloud2()
+        msg.header = Header(stamp=self.get_clock().now().to_msg(), frame_id='benchmark_frame')
+        msg.height = 1
+        msg.width = num_points
+        msg.is_dense = True
+        msg.fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.point_step = 12
+        msg.row_step = msg.point_step * num_points
+        msg.data = points.tobytes()
+        msg.is_bigendian = sys.byteorder != 'little'
+        return msg
 
+    def run_single_test(self, message):
+        self.pong_received = False
+        self.pong_received_time = None
+        
+        self.publisher.publish(message)
+        
+        timeout_sec = 5.0
+        start_wait_time = time.monotonic()
+        while not self.pong_received and (time.monotonic() - start_wait_time) < timeout_sec:
+            rclpy.spin_once(self, timeout_sec=0.01)
 
-def run_benchmark(language_name, duration=10):
-    """Run a benchmark node for a specified duration."""
-    rclpy.init()
+        if not self.pong_received:
+            return None
+
+        msg_timestamp = rclpy.time.Time.from_msg(message.header.stamp)
+        latency_ns = self.pong_received_time.nanoseconds - msg_timestamp.nanoseconds
+        return latency_ns / 1e6  # Convert to milliseconds
+
+def run_benchmark_for_target(target, num_iterations, num_points):
+    """Launches and benchmarks a single target language node."""
+    print(f"\n--- Benchmarking {target['lang']} ---")
     
-    subscriber = BenchmarkSubscriber(language_name)
+    node_cmd = ['ros2', 'run', target['package'], target['executable']]
+    pong_process = subprocess.Popen(node_cmd)
+    print(f"Launched '{' '.join(node_cmd)}'. Waiting for initialization...")
+    time.sleep(5)
+
+    runner = BenchmarkRunner(target['pong_topic'])
+    latencies = []
     
-    # Start the benchmark node
-    if language_name == 'python':
-        process = subprocess.Popen(
-            ['ros2', 'run', 'ros2_lang_eval', 'python_benchmark_node'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE)
-    elif language_name == 'cpp':
-        process = subprocess.Popen(
-            ['ros2', 'run', 'ros2_lang_eval', 'cpp_benchmark_node'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE)
-    elif language_name == 'rust':
-        # Note: Rust node needs to be built separately
-        process = subprocess.Popen(
-            ['cargo', 'run', '--release', '--manifest-path', 'src/rust/Cargo.toml'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE)
-    else:
-        print(f'Unknown language: {language_name}')
-        return None
-
-    # Run for specified duration
-    start_time = time.time()
-    while time.time() - start_time < duration:
-        rclpy.spin_once(subscriber, timeout_sec=0.1)
-        time.sleep(0.1)
-
-    # Stop the process
-    process.terminate()
     try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
+        message = runner.create_point_cloud_message(num_points)
+        
+        print("Running warm-up iterations...")
+        for _ in range(5):
+            runner.run_single_test(message)
+            time.sleep(0.1)
 
-    subscriber.destroy_node()
+        print("Starting benchmark...")
+        for i in range(num_iterations):
+            latency_ms = runner.run_single_test(message)
+            if latency_ms is not None:
+                latencies.append(latency_ms)
+                print(f"Iteration {i+1}/{num_iterations}: Latency = {latency_ms:.3f} ms")
+            else:
+                print(f"Iteration {i+1}/{num_iterations}: Failed (Timeout)")
+            time.sleep(0.1)
+    finally:
+        print("Shutting down node...")
+        pong_process.terminate()
+        pong_process.wait()
+        runner.destroy_node()
+
+    if not latencies:
+        return None
+    
+    return {
+        'avg': np.mean(latencies),
+        'std': np.std(latencies),
+        'min': np.min(latencies),
+        'max': np.max(latencies),
+    }
+
+def main(args=None):
+    rclpy.init(args=args)
+    
+    num_iterations = 20
+    num_points = 100000
+    all_results = collections.OrderedDict()
+
+    print("====== ROS2 Language Performance Benchmark ======")
+    print(f"Message Type: PointCloud2 ({num_points} points)")
+    print(f"Iterations per target: {num_iterations}")
+    print("===============================================")
+    
+    for target in TARGETS:
+        results = run_benchmark_for_target(target, num_iterations, num_points)
+        if results:
+            all_results[target['lang']] = results
+        else:
+            print(f"!!! Benchmark for {target['lang']} failed. Skipping. !!!")
+
     rclpy.shutdown()
 
-    # Calculate average
-    if subscriber.results:
-        avg_time = sum(subscriber.results) / len(subscriber.results)
-        return {
-            'language': language_name,
-            'average_time': avg_time,
-            'results': subscriber.results
-        }
-    return None
-
-
-def main():
-    """Run benchmarks for all languages."""
-    print("ROS2 Language Performance Comparison")
-    print("=" * 50)
-    
-    languages = ['python', 'cpp', 'rust']
-    all_results = {}
-
-    for lang in languages:
-        print(f"\nRunning {lang} benchmark...")
-        try:
-            result = run_benchmark(lang, duration=10)
-            if result:
-                all_results[lang] = result
-                print(f"{lang} average: {result['average_time']:.6f} seconds")
-        except Exception as e:
-            print(f"Error running {lang} benchmark: {e}")
-
-    # Print summary
-    print("\n" + "=" * 50)
-    print("Benchmark Summary")
-    print("=" * 50)
-    
+    print("\n\n--- Benchmark Summary ---")
     if all_results:
-        # Sort by average time
-        sorted_results = sorted(
-            all_results.items(),
-            key=lambda x: x[1]['average_time'])
-        
-        for lang, result in sorted_results:
-            print(f"{lang:10s}: {result['average_time']:.6f} seconds")
-        
-        # Calculate speedup
-        if len(sorted_results) > 1:
-            baseline = sorted_results[0][1]['average_time']
-            print("\nSpeedup compared to fastest:")
-            for lang, result in sorted_results:
-                speedup = result['average_time'] / baseline
-                print(f"{lang:10s}: {speedup:.2f}x")
+        header = f"{'{'Language'}':<10} | $'{'Avg Latency (ms)'}':<20} | $'{'Std Dev (ms)'}':<15} | $'{'Min (ms)'}':<10} | $'{'Max (ms)'}':<10}"
+        print(header)
+        print('-' * len(header))
+        for lang, results in all_results.items():
+            print(f"{lang:<10} | {results['avg']:<20.3f} | {results['std']:<15.3f} | {results['min']:<10.3f} | {results['max']:<10.3f}")
+    else:
+        print("No results recorded. All benchmarks may have failed.")
+    print('-' * len(header))
 
 
 if __name__ == '__main__':
